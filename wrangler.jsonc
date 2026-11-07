@@ -1,0 +1,26 @@
+{
+  "name": "studyflow",
+  "main": "server/src/worker.ts",
+  "compatibility_date": "2026-11-06",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "assets": {
+    "directory": "./client/dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/api/*"
+    ]
+  },
+  "vars": {
+    "CLERK_ISSUER": "https://faithful-mustang-4577.clerk.accounts.dev",
+    "CLIENT_ORIGIN": "https://studyflow.2wf0w2.workers.dev"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "studyflow-db",
+      "database_id": "fed31942-1e0f-4798-afe4-623642afb218"
+    }
+  ]
+}

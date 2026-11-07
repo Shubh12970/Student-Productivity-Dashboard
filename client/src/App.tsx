@@ -8,6 +8,7 @@ import {
   X, Pause, RotateCcw, Coffee, Brain, BarChart3, Bell, Pencil, BookMarked,
   ClipboardCheck
 } from "lucide-react";
+import { useAuth, useSignIn, useSignUp, useUser } from "@clerk/react";
 import "./App.css";
 
 type Subject = { id: string; name: string; color: string };
@@ -20,6 +21,10 @@ type StoredNote = { id: string; name: string; subjectId: string; date: string; s
 const PALETTE = ["#28245f", "#303b91", "#275db2", "#207fbd", "#169fd6", "#20b7e8", "#29457c", "#27649c", "#2789bd", "#24a6d5"];
 const TODAY = () => new Date().toISOString().slice(0, 10);
 const makeId = () => Math.random().toString(36).slice(2, 10);
+const API_URL = (import.meta.env.VITE_API_URL as string | undefined) ?? "http://localhost:5000";
+type ApiTask = { _id: string; title: string; completed: boolean; priority: "low" | "medium" | "high"; dueDate: string | null; subjectId?: string; notes?: string; sessions?: number };
+const priorityFromApi = (p: string): Task["priority"] => p === "high" ? "High" : p === "low" ? "Low" : "Medium";
+const fromApiTask = (t: ApiTask): Task => ({ id: t._id, title: t.title, done: t.completed, priority: priorityFromApi(t.priority), due: t.dueDate ? t.dueDate.slice(0, 10) : TODAY(), subjectId: t.subjectId || "s1", notes: t.notes || "", sessions: t.sessions ?? 0 });
 const initialSubjects: Subject[] = [
   { id: "s1", name: "Signals & Systems", color: "#207fbd" },
   { id: "s2", name: "Data Structures", color: "#169fd6" },
@@ -91,6 +96,10 @@ export default function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [name, setName] = useState("");
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [token, setToken] = useState<string>(() => readStore("sf-token", ""));
+  const [userName, setUserName] = useState<string>(() => readStore("sf-user-name", ""));
   const [toast, setToast] = useState("");
 
   useEffect(() => { localStorage.setItem("sf-dark", JSON.stringify(dark)); }, [dark]);
@@ -99,6 +108,49 @@ export default function App() {
   useEffect(() => { localStorage.setItem("sf-logs", JSON.stringify(logs)); }, [logs]);
   useEffect(() => { localStorage.setItem("sf-notes", JSON.stringify(notes)); }, [notes]);
   useEffect(() => { localStorage.setItem("sf-attendance", JSON.stringify(attendance)); }, [attendance]);
+  useEffect(() => { localStorage.setItem("sf-token", JSON.stringify(token)); }, [token]);
+
+  // --- Clerk managed authentication ---
+  const { isLoaded: clerkLoaded, isSignedIn, getToken, signOut: clerkSignOut } = useAuth();
+  const { user: clerkUser } = useUser();
+  const { signIn: clerkSignIn } = useSignIn();
+  const { signUp: clerkSignUp } = useSignUp();
+  const [code, setCode] = useState("");
+  const [pendingCode, setPendingCode] = useState<"signup" | "login" | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+
+  // Keep the API bearer token synced to the Clerk session, refreshing before
+  // Clerk's short-lived session tokens expire.
+  useEffect(() => {
+    if (!clerkLoaded) return;
+    let cancelled = false;
+    const syncToken = async () => {
+      if (!isSignedIn) { setToken(""); return; }
+      try {
+        const t = await getToken();
+        if (!cancelled) setToken(t || "");
+      } catch { if (!cancelled) setToken(""); }
+    };
+    void syncToken();
+    const iv = setInterval(syncToken, 30000);
+    return () => { cancelled = true; clearInterval(iv); };
+  }, [clerkLoaded, isSignedIn, getToken]);
+
+  // Show the signed-in name from the Clerk profile.
+  useEffect(() => {
+    if (isSignedIn && clerkUser) {
+      setUserName(clerkUser.firstName || clerkUser.username || clerkUser.primaryEmailAddress?.emailAddress.split("@")[0] || "");
+    }
+    if (!isSignedIn) setUserName("");
+  }, [isSignedIn, clerkUser]);
+  useEffect(() => { localStorage.setItem("sf-user-name", JSON.stringify(userName)); }, [userName]);
+  useEffect(() => {
+    if (!token) return;
+    fetch(`${API_URL}/api/tasks`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error("load failed"))))
+      .then((rows: ApiTask[]) => setTasks(rows.map(fromApiTask)))
+      .catch(() => setToast("Could not load your synced tasks"));
+  }, [token]);
   useEffect(() => { if (!toast) return; const id = window.setTimeout(() => setToast(""), 2600); return () => window.clearTimeout(id); }, [toast]);
   useEffect(() => {
     if (!timerRunning) return;
@@ -132,14 +184,37 @@ export default function App() {
   }), [logs]);
   const subjectMinutes = subjects.map(s => ({ ...s, minutes: logs.filter(l => l.subjectId === s.id).reduce((sum, l) => sum + l.minutes, 0) }));
 
-  function addTask(e: React.FormEvent) {
+  async function addTask(e: React.FormEvent) {
     e.preventDefault(); if (!taskTitle.trim()) return;
     const task: Task = { id: editingTask ?? makeId(), title: taskTitle.trim(), subjectId: taskSubject, due: taskDue, priority: taskPriority, done: false, notes: taskNotes, sessions: taskSessions };
-    setTasks(old => editingTask ? old.map(t => t.id === editingTask ? { ...task, done: t.done } : t) : [task, ...old]);
-    setTaskTitle(""); setTaskNotes(""); setTaskSessions(2); setTaskModal(false); setEditingTask(null); setToast(editingTask ? "Task updated" : "Task added to your plan");
+    let note = editingTask ? "Task updated" : "Task added to your plan";
+    const applyLocal = () => setTasks(old => editingTask ? old.map(t => t.id === editingTask ? { ...task, done: t.done } : t) : [task, ...old]);
+    if (token) {
+      try {
+        const payload = { title: task.title, priority: task.priority.toLowerCase(), dueDate: task.due, subjectId: task.subjectId, notes: task.notes, sessions: task.sessions };
+        const res = await fetch(editingTask ? `${API_URL}/api/tasks/${editingTask}` : `${API_URL}/api/tasks`, {
+          method: editingTask ? "PATCH" : "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          const saved = fromApiTask(await res.json());
+          setTasks(old => editingTask ? old.map(t => t.id === editingTask ? { ...saved, done: t.done } : t) : [saved, ...old]);
+        } else { applyLocal(); note = "Saved on this device - sync will retry next visit"; }
+      } catch { applyLocal(); note = "Saved on this device - sync will retry next visit"; }
+    } else {
+      applyLocal();
+    }
+    setTaskTitle(""); setTaskNotes(""); setTaskSessions(2); setTaskModal(false); setEditingTask(null); setToast(note);
   }
   function openEdit(task: Task) { setEditingTask(task.id); setTaskTitle(task.title); setTaskSubject(task.subjectId); setTaskDue(task.due); setTaskPriority(task.priority); setTaskNotes(task.notes); setTaskSessions(task.sessions); setTaskModal(true); }
-  function toggleTask(id: string) { setTasks(old => old.map(t => t.id === id ? { ...t, done: !t.done } : t)); }
+  function toggleTask(id: string) {
+    const target = tasks.find(t => t.id === id);
+    setTasks(old => old.map(t => t.id === id ? { ...t, done: !t.done } : t));
+    if (token && target) {
+      fetch(`${API_URL}/api/tasks/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ completed: !target.done }) }).catch(() => {});
+    }
+  }
   function logFocusSession() {
     if (timerMode !== "focus") { setTimerMode("focus"); setTimerRunning(false); return; }
     const matchingTask = tasks.find(t => t.title.trim().toLowerCase() === pomodoroTask.trim().toLowerCase());
@@ -163,7 +238,89 @@ export default function App() {
     if (files.length) setToast("File details added to your library");
     e.target.value = "";
   }
-  function signIn(e: React.FormEvent) { e.preventDefault(); setLoginScreen(false); setToast("Demo session opened — connect authentication before using real accounts."); }
+  function clerkErrorMessage(err: unknown, fallback: string): string {
+    const anyErr = err as { errors?: { code?: string; longMessage?: string; message?: string }[]; message?: string } | null;
+    const first = anyErr?.errors?.[0];
+    const errCode = first?.code || "";
+    if (errCode === "form_identifier_not_found" || errCode === "form_password_incorrect") {
+      return "Invalid email or password.";
+    }
+    if (errCode === "form_password_pwned" || errCode === "form_password_not_strong_enough") {
+      return "That password is too easy to guess. Try a stronger one.";
+    }
+    if (errCode === "form_password_length_too_short") {
+      return "Password must be at least 8 characters long.";
+    }
+    return first?.longMessage || anyErr?.message || fallback;
+  }
+
+  function finishSignIn(mode: "login" | "signup") {
+    setPendingCode(null); setCode(""); setLoginScreen(false);
+    setToast(mode === "login" ? "Welcome back! Your tasks now sync to your account." : "Account created! Your tasks now sync to your account.");
+  }
+
+  async function signIn(e: React.FormEvent) {
+    e.preventDefault();
+    if (!clerkLoaded || !clerkSignIn || !clerkSignUp) { setToast("Sign-in is still loading. Try again in a moment."); return; }
+    setAuthBusy(true);
+    try {
+      if (authMode === "login") {
+        const { error } = await clerkSignIn.password({ emailAddress: email.trim(), password });
+        if (error) { setToast(clerkErrorMessage(error, "Could not sign in. Try again.")); return; }
+        if (clerkSignIn.status === "complete") {
+          await clerkSignIn.finalize();
+          finishSignIn("login");
+        } else if (clerkSignIn.status === "needs_client_trust" || clerkSignIn.status === "needs_second_factor") {
+          const send = await clerkSignIn.mfa.sendEmailCode();
+          if (send.error) { setToast(clerkErrorMessage(send.error, "Could not send the verification email.")); return; }
+          setPendingCode("login");
+          setToast("New device - we emailed you a 6-digit code to confirm it is you.");
+        } else {
+          setToast("Could not sign in. Try again.");
+        }
+      } else {
+        const { error } = await clerkSignUp.password({ emailAddress: email.trim(), password, firstName: name.trim() || undefined });
+        if (error) { setToast(clerkErrorMessage(error, "Could not create the account. Try again.")); return; }
+        await clerkSignUp.verifications.sendEmailCode();
+        setPendingCode("signup");
+        setToast("We emailed you a 6-digit code. Enter it to finish creating your account.");
+      }
+    } catch (err) {
+      setToast(clerkErrorMessage(err, "Could not reach the sign-in service. Check your connection."));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  async function verifyCode(e: React.FormEvent) {
+    e.preventDefault();
+    if (!clerkSignIn || !clerkSignUp || !pendingCode) return;
+    setAuthBusy(true);
+    try {
+      if (pendingCode === "signup") {
+        const { error } = await clerkSignUp.verifications.verifyEmailCode({ code });
+        if (error) { setToast(clerkErrorMessage(error, "That code did not work. Check it and try again.")); return; }
+        if (clerkSignUp.status === "complete") { await clerkSignUp.finalize(); finishSignIn("signup"); return; }
+      } else {
+        const { error } = await clerkSignIn.mfa.verifyEmailCode({ code });
+        if (error) { setToast(clerkErrorMessage(error, "That code did not work. Check it and try again.")); return; }
+        if (clerkSignIn.status === "complete") { await clerkSignIn.finalize(); finishSignIn("login"); return; }
+      }
+      setToast("Almost there - finish the remaining sign-in steps.");
+    } catch (err) {
+      setToast(clerkErrorMessage(err, "Could not verify the code. Try again."));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
+  function signOut() { void clerkSignOut(); setPendingCode(null); setCode(""); setToast("Signed out. Tasks stay on this device in guest mode."); }
+  async function deleteTask(id: string) {
+    setTasks(old => old.filter(t => t.id !== id));
+    if (token) {
+      try { await fetch(`${API_URL}/api/tasks/${id}`, { method: "DELETE", headers: { Authorization: `Bearer ${token}` } }); } catch { /* stays deleted locally */ }
+    }
+  }
   function monthCells(date: Date) {
     const first = new Date(date.getFullYear(), date.getMonth(), 1);
     const offset = (first.getDay() + 6) % 7;
@@ -198,11 +355,11 @@ export default function App() {
     return <div className={`task-row ${task.done ? "is-done" : ""}`} key={task.id}>
       <button className={`task-check ${task.done ? "checked" : ""}`} onClick={() => toggleTask(task.id)} aria-label={task.done ? "Mark incomplete" : "Complete task"}>{task.done && <Check size={14}/>}</button>
       <div className="task-main"><strong>{task.title}</strong><div className="task-meta"><span className="subject-tag"><i style={{ background: subject.color }}/>{subject.name}</span><span><Clock3 size={12}/>{task.sessions} sessions</span><span><CalendarDays size={12}/>{task.due}</span></div>{task.notes && <p className="task-note-preview">{task.notes}</p>}</div>
-      <span className={`priority priority-${task.priority.toLowerCase()}`}>{task.priority}</span><button className="icon-button task-more" onClick={() => openEdit(task)} title="Edit task"><Pencil size={15}/></button><button className="icon-button task-more" onClick={() => setTasks(old => old.filter(t => t.id !== task.id))} title="Delete task"><Trash2 size={15}/></button>
+      <span className={`priority priority-${task.priority.toLowerCase()}`}>{task.priority}</span><button className="icon-button task-more" onClick={() => openEdit(task)} title="Edit task"><Pencil size={15}/></button><button className="icon-button task-more" onClick={() => deleteTask(task.id)} title="Delete task"><Trash2 size={15}/></button>
     </div>;
   })}</div> : <div className="empty-state"><CheckCircle2 size={25}/><strong>All clear for now</strong><span>Add a task to make your next study session count.</span></div>;
 
-  if (loginScreen) return <div className={`login-screen ${dark ? "dark-mode" : ""}`}><div className="login-art"><div className="login-doodle doodle-book"><BookOpen size={44}/></div><div className="login-doodle doodle-spark"><Sparkles size={30}/></div><div className="login-brand"><span className="brand-mark"><GraduationCap size={25}/></span><span>studyflow<span className="brand-dot">.</span></span></div><h1>Make time for<br/><em>what matters.</em></h1><p>A calmer way to plan your studies, build consistency, and understand your focus.</p><div className="login-art-bottom"><span><Flame size={16}/> Small steps. Real streaks.</span><span><Brain size={16}/> Reflect. Learn. Improve.</span></div></div><form className="login-form-card" onSubmit={signIn}><button type="button" className="login-close icon-button" onClick={() => setLoginScreen(false)} aria-label="Close"><X size={18}/></button><span className="eyebrow">YOUR STUDY SPACE</span><h2>Welcome back</h2><p>Sign in to continue your study journey.</p><label>Email address</label><div className="field-with-icon"><UserRound size={17}/><input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com"/></div><label>Password</label><div className="field-with-icon"><ShieldCheck size={17}/><input type={showPassword ? "text" : "password"} required minLength={6} value={password} onChange={e => setPassword(e.target.value)} placeholder="At least 6 characters"/><button type="button" onClick={() => setShowPassword(!showPassword)}>{showPassword ? "Hide" : "Show"}</button></div><button className="primary-button login-submit" type="submit"><LogIn size={17}/> Continue <ArrowRight size={17}/></button><div className="login-divider"><span/>or<span/></div><button className="google-button" type="button" onClick={() => setToast("Google sign-in needs OAuth credentials and a backend connection.")}><span className="google-g">G</span> Continue with Google</button><p className="login-legal"><ShieldCheck size={14}/> Demo interface only. Secure account creation and Google sign-in must be wired to a backend.</p></form></div>;
+  if (loginScreen) return <div className={`login-screen ${dark ? "dark-mode" : ""}`}><div className="login-art"><div className="login-doodle doodle-book"><BookOpen size={44}/></div><div className="login-doodle doodle-spark"><Sparkles size={30}/></div><div className="login-brand"><span className="brand-mark"><GraduationCap size={25}/></span><span>studyflow<span className="brand-dot">.</span></span></div><h1>Make time for<br/><em>what matters.</em></h1><p>A calmer way to plan your studies, build consistency, and understand your focus.</p><div className="login-art-bottom"><span><Flame size={16}/> Small steps. Real streaks.</span><span><Brain size={16}/> Reflect. Learn. Improve.</span></div></div><form className="login-form-card" onSubmit={pendingCode ? verifyCode : signIn}><button type="button" className="login-close icon-button" onClick={() => setLoginScreen(false)} aria-label="Close"><X size={18}/></button><span className="eyebrow">YOUR STUDY SPACE</span>{pendingCode ? <><h2>Check your email</h2><p>Enter the 6-digit code we sent to {email}.</p><label>Verification code</label><div className="field-with-icon"><ShieldCheck size={17}/><input type="text" inputMode="numeric" autoComplete="one-time-code" required minLength={6} maxLength={6} value={code} onChange={e => setCode(e.target.value.replace(/[^0-9]/g, ""))} placeholder="6-digit code"/></div><button className="primary-button login-submit" type="submit" disabled={authBusy}><LogIn size={17}/> Verify <ArrowRight size={17}/></button><p className="login-legal" style={{ cursor: "pointer" }} onClick={() => { setPendingCode(null); setCode(""); }}>Wrong email? Go back</p></> : <>{authMode === "login" ? <><h2>Welcome back</h2><p>Sign in to continue your study journey.</p></> : <><h2>Create your account</h2><p>Sync your tasks across devices.</p></>}<label>Email address</label><div className="field-with-icon"><UserRound size={17}/><input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com"/></div>{authMode === "signup" && <><label>Your name</label><div className="field-with-icon"><UserRound size={17}/><input type="text" required value={name} onChange={e => setName(e.target.value)} placeholder="What should we call you?"/></div></>}<label>Password</label><div className="field-with-icon"><ShieldCheck size={17}/><input type={showPassword ? "text" : "password"} required minLength={8} value={password} onChange={e => setPassword(e.target.value)} placeholder="At least 8 characters"/><button type="button" onClick={() => setShowPassword(!showPassword)}>{showPassword ? "Hide" : "Show"}</button></div><button className="primary-button login-submit" type="submit" disabled={authBusy}><LogIn size={17}/> Continue <ArrowRight size={17}/></button><div className="login-divider"><span/>or<span/></div><button className="google-button" type="button" onClick={() => setToast("Google sign-in needs OAuth credentials and a backend connection.")}><span className="google-g">G</span> Continue with Google</button><p className="login-legal"><ShieldCheck size={14}/> Passwords are securely hashed before storage.</p><p className="login-legal" style={{ cursor: "pointer" }} onClick={() => setAuthMode(authMode === "login" ? "signup" : "login")}>{authMode === "login" ? "New here? Create an account" : "Already have an account? Sign in"}</p></>}</form></div>;
 
   return <div className={`app-shell ${dark ? "dark-mode" : ""}`}>
     {mobileNav && <button className="mobile-scrim" onClick={() => setMobileNav(false)} aria-label="Close navigation"/>}
@@ -210,7 +367,7 @@ export default function App() {
       <div className="brand"><span className="brand-mark"><GraduationCap size={24}/></span><span>studyflow<span className="brand-dot">.</span></span><button className="mobile-close icon-button" onClick={() => setMobileNav(false)}><X size={18}/></button></div>
       <div className="profile-chip"><div className="avatar">S</div><div><strong>Student space</strong><span>Keep showing up</span></div><MoreHorizontal size={17}/></div>
       <nav>{["STUDY SPACE", "LIBRARY", "INSIGHTS"].map(group => <div className="nav-group" key={group}><span className="nav-label">{group}</span>{navItems.filter(n => n.group === group).map(item => { const Icon = item.icon; return <button key={item.label} className={`nav-item ${page === item.label ? "active" : ""}`} onClick={() => { setPage(item.label); setMobileNav(false); }}><Icon size={18}/><span>{item.label}</span>{item.label === "Pomodoro" && <span className="nav-new">FOCUS</span>}</button>; })}</div>)}</nav>
-      <div className="sidebar-bottom"><div className="streak-mini"><div className="streak-icon"><Flame size={19}/></div><div><strong>{streak} day streak</strong><span>Consistency over intensity</span></div></div><div className="sidebar-quote"><Sparkles size={15}/><span>One focused session is a win.</span></div><button className="profile-bottom" onClick={() => setLoginScreen(true)}><div className="avatar">S</div><div><strong>Your account</strong><span>Demo profile</span></div><Settings2 size={17}/></button></div>
+      <div className="sidebar-bottom"><div className="streak-mini"><div className="streak-icon"><Flame size={19}/></div><div><strong>{streak} day streak</strong><span>Consistency over intensity</span></div></div><div className="sidebar-quote"><Sparkles size={15}/><span>One focused session is a win.</span></div><button className="profile-bottom" onClick={() => token ? signOut() : setLoginScreen(true)}><div className="avatar">{userName ? userName[0].toUpperCase() : "S"}</div><div><strong>{userName || "Your account"}</strong><span>{token ? "Synced account" : "Guest - saved on this device"}</span></div><Settings2 size={17}/></button></div>
     </aside>
     <main className="main-area">
       <header className="topbar"><button className="mobile-menu icon-button" onClick={() => setMobileNav(true)} aria-label="Open menu"><Menu size={20}/></button><div className="breadcrumb"><span>Study space</span><ChevronRight size={14}/><strong>{page}</strong></div><div className="topbar-actions"><div className="topbar-date"><CalendarDays size={15}/>{new Date().toLocaleDateString("en", { weekday: "short", month: "short", day: "numeric" })}</div><button className="icon-button top-icon" title="Notifications" onClick={() => setToast("You're all caught up — keep going!") }><Bell size={18}/><i className="notification-dot"/></button><button className="theme-toggle" onClick={() => setDark(!dark)} title={dark ? "Switch to light mode" : "Switch to dark mode"} aria-label={dark ? "Switch to light mode" : "Switch to dark mode"}>{dark ? <Sun size={18}/> : <Moon size={18}/>}<span>{dark ? "Light" : "Dark"}</span></button></div></header>
