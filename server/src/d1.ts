@@ -58,3 +58,23 @@ export function rowToApi(r: TaskRow) {
     updatedAt: r.updated_at,
   };
 }
+
+export interface ReflectionRow {
+  id: string;
+  user_id: string;
+  task_id: string;
+  task_title: string;
+  text: string;
+  created_at: string;
+}
+
+export function rowToApiReflection(r: ReflectionRow) {
+  return {
+    _id: r.id,
+    userId: r.user_id,
+    taskId: r.task_id,
+    taskTitle: r.task_title,
+    text: r.text,
+    createdAt: r.created_at,
+  };
+}
